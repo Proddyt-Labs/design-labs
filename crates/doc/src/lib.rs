@@ -10,11 +10,16 @@
 #![forbid(unsafe_code)]
 
 pub mod anchored;
+pub mod arabic;
 pub mod arrow;
+pub mod assets;
 pub mod attrs;
 pub mod build;
+pub mod cjk;
+pub mod datamerge;
 mod edit;
 pub mod endnotes;
+pub mod flex;
 pub mod ids;
 pub mod index;
 pub mod item;
@@ -33,11 +38,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use anchored::{AnchorPosition, AnchoredObject, OBJECT_MARK};
+pub use assets::{find_same_asset, insert_asset, remap_story_assets, story_asset_refs};
 pub use attrs::*;
+pub use datamerge::{
+    DataField, DataFieldKind, DataMerge, DataSource, Delimiter, Fingerprint, MergeOptions, Placeholder, PlaceholderAnchor, PlaceholderRole,
+    SourceStatus,
+};
 pub use designcraft_color as color;
 pub use designcraft_geom as geom;
 pub use edit::{ItemLoc, ItemPath, SpreadRef, item_hit as edit_hit};
 pub use endnotes::{ENDNOTE_REF, EditorialNote, EndnoteOptions, NOTE_MARK};
+pub use flex::{FlexAlign, FlexDirection, FlexJustify, FlexLayout, FlexSize};
 pub use ids::*;
 pub use index::{INDEX_MARK, IndexRef};
 pub use item::*;
@@ -134,18 +145,12 @@ impl Default for DocumentGrid {
 }
 
 /// A named numbered list.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NumberedList {
     pub name: String,
     /// Numbering continues from story to story (in page order).
     pub continue_across_stories: bool,
-}
-
-impl Default for NumberedList {
-    fn default() -> Self {
-        NumberedList { name: String::new(), continue_across_stories: true }
-    }
 }
 
 /// A conditional-text condition: its indicator colour (screen only) and whether text with it shows.
@@ -338,6 +343,12 @@ pub struct DocSettings {
     pub overprint_black: bool,
     /// Type › Track Changes: edits are recorded as inserted / deleted text.
     pub track_changes: bool,
+    /// Preferences › Composition › Draw Missing Glyphs from Fallback Fonts: characters the
+    /// applied font lacks are drawn from other fonts. Off (InDesign's behaviour, and new
+    /// documents'), they are drawn as the font's missing-glyph box and Preflight lists them.
+    /// Documents saved before the setting existed read as on, the way they were drawn.
+    #[serde(default = "yes")]
+    pub glyph_fallback: bool,
 }
 
 impl Default for DocSettings {
@@ -369,6 +380,7 @@ impl Default for DocSettings {
             blend_space: BlendSpace::Cmyk,
             overprint_black: true,
             track_changes: false,
+            glyph_fallback: false,
         }
     }
 }
@@ -436,6 +448,16 @@ pub struct Asset {
     pub page: u32,
 }
 
+impl Asset {
+    /// A raster image (PNG, JPEG, GIF, WebP, TIFF, BMP, PSD), as opposed to a PDF, EPS or SVG.
+    pub fn is_raster(&self) -> bool {
+        matches!(
+            self.mime.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/tiff" | "image/bmp" | "image/vnd.adobe.photoshop"
+        )
+    }
+}
+
 fn is_zero(v: &u32) -> bool {
     *v == 0
 }
@@ -482,6 +504,9 @@ pub struct Document {
     /// Hyperlinks (Window → Interactive → Hyperlinks).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hyperlinks: Vec<Hyperlink>,
+    /// Data merge: the linked table, placeholders, and the last merge options.
+    #[serde(default, skip_serializing_if = "DataMerge::is_empty")]
+    pub data_merge: DataMerge,
     /// PDF bookmarks (Window → Interactive → Bookmarks).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<Bookmark>,
@@ -513,6 +538,11 @@ pub struct Document {
     #[serde(default)]
     pub modified: i64,
     pub next_id: u64,
+    /// While the document is open, the font scope of the fonts it brought (its `Document Fonts`
+    /// folder): composition, export and the font menus look its fonts up there. 0: none. Not
+    /// saved.
+    #[serde(skip)]
+    pub font_scope: u32,
 }
 
 /// What a hyperlink is attached to.
@@ -550,6 +580,30 @@ pub struct TocEntry {
     /// 1-based nesting level.
     #[serde(default = "one")]
     pub level: u8,
+    /// Paragraph style of this style's entries; `None` is the generated "TOC Level n" style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_style: Option<String>,
+    #[serde(default)]
+    pub page_number: TocPageNumber,
+    /// Text between the entry and its page number; `None` is a tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separator: Option<String>,
+}
+
+impl TocEntry {
+    pub fn new(style: impl Into<String>, level: u8) -> Self {
+        Self { style: style.into(), level, entry_style: None, page_number: TocPageNumber::After, separator: None }
+    }
+}
+
+/// Where an entry's page number goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TocPageNumber {
+    #[default]
+    After,
+    Before,
+    None,
 }
 
 fn one() -> u8 {
@@ -564,6 +618,9 @@ pub struct Toc {
     pub entries: Vec<TocEntry>,
     #[serde(default)]
     pub page_numbers: bool,
+    /// Paragraph style of the title; `None` is the generated "TOC Title" style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_style: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -675,6 +732,18 @@ impl Document {
 
     /// Validate structural invariants (ids unique, threads consistent, stories well-formed).
     pub fn check(&self) -> Result<()> {
+        for f in &self.styles.composite_fonts {
+            if f.entries.iter().any(|e| {
+                ![e.relative_size, e.horizontal_scale, e.vertical_scale].iter().all(|v| v.is_finite() && *v > 0.0) || !e.baseline_shift.is_finite()
+            }) {
+                return Err(DocError::Invalid(format!("invalid composite font metrics: {}", f.name)));
+            }
+        }
+        for t in &self.styles.mojikumi_tables {
+            if t.overrides.iter().any(|r| ![r.minimum, r.desired, r.maximum].iter().all(|v| v.is_finite())) {
+                return Err(DocError::Invalid(format!("non-finite mojikumi spacing: {}", t.name)));
+            }
+        }
         let mut ids = std::collections::HashSet::new();
         for sp in self.spreads.iter().chain(self.parents.iter()) {
             for it in &sp.items {
